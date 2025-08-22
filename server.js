@@ -1,88 +1,63 @@
 // backend/server.js
-// Env-ready Express API for car-tracker
-
-// 1) Load env (local only—hosted platforms inject env themselves)
-try { require('dotenv').config(); } catch (_) {}
-
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const bodyParser = require('body-parser');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
+const port = process.env.PORT || 3000;
 
-// ---- ENV ----
-const PORT        = process.env.PORT || 3000;
-const MONGO_URL   = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const NODE_ENV    = process.env.NODE_ENV || 'development';
-
-// ---- Middleware ----
-app.set('trust proxy', 1); // needed if behind a proxy (Render/Heroku)
-app.use(express.json());   // replaces body-parser for JSON
-
-const corsOptions = {
-  origin:
-    CORS_ORIGIN === '*'
-      ? true // allow all (no credentials)
-      : CORS_ORIGIN.split(',').map(s => s.trim()),
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // preflight
-
-// ---- MongoDB ----
-mongoose.set('strictQuery', true);
-mongoose
-  .connect(MONGO_URL, {
-    // modern mongoose doesn’t require useNewUrlParser/useUnifiedTopology
-    serverSelectionTimeoutMS: 8000,
+// Middleware
+app.use(bodyParser.json());
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type'],
   })
-  .then(() => console.log('MongoDB connected successfully'))
-  .catch(err => {
-    console.error('MongoDB connection error:', err.message);
-    // don’t exit; app can still serve health/errors to aid debugging
-  });
-
-mongoose.connection.on('disconnected', () =>
-  console.warn('MongoDB disconnected')
 );
 
-// ---- Models ----
+// MongoDB connection
+mongoose.set('strictQuery', true);
+
+const MONGO_URL =
+  process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
+
+mongoose
+  .connect(MONGO_URL, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('MongoDB connected successfully'))
+  .catch((err) => console.error('MongoDB connection error:', err));
+
+// User schema
 const userSchema = new mongoose.Schema(
   {
-    name:      { type: String, required: true },
-    email:     { type: String, required: true, unique: true, index: true },
-    password:  { type: String, required: true },
+    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true, index: true },
+    password: { type: String, required: true },
     fuelPrice: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
+
 const User = mongoose.model('User', userSchema);
 
-// ---- Helpers ----
-const sanitizeUser = u => ({
+// Helpers
+const sanitizeUser = (u) => ({
   name: u.name,
   email: u.email,
   fuelPrice: u.fuelPrice ?? 0,
 });
 
-// ---- Routes ----
+// Routes
 
-// Health + meta
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'Server is running',
-    env: NODE_ENV,
-    mongo: mongoose.connection.readyState === 1 ? 'connected' : 'not-connected',
-  });
+  res.status(200).json({ status: 'Server is running' });
 });
 
-// Registration
 app.post('/register', async (req, res) => {
-  console.log('POST /register', req.body?.email);
-  const { name, email, password } = req.body || {};
+  const { name, email, password } = req.body;
   if (!name || !email || !password)
     return res.status(400).json({ message: 'Please fill in all fields' });
 
@@ -93,21 +68,23 @@ app.post('/register', async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
+    const newUser = new User({ name, email, password: hashedPassword });
+    await newUser.save();
 
-    const newUser = await User.create({ name, email, password: hashedPassword });
     res
       .status(201)
-      .json({ message: `Welcome ${name}! Account created successfully.`, ...sanitizeUser(newUser) });
+      .json({
+        message: `Welcome ${name}! Account created successfully.`,
+        ...sanitizeUser(newUser),
+      });
   } catch (err) {
     console.error('Registration error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Login
 app.post('/login', async (req, res) => {
-  console.log('POST /login', req.body?.email);
-  const { email, password } = req.body || {};
+  const { email, password } = req.body;
   if (!email || !password)
     return res.status(400).json({ message: 'Please fill in all fields' });
 
@@ -120,19 +97,20 @@ app.post('/login', async (req, res) => {
     if (!isMatch)
       return res.status(400).json({ message: 'Invalid email or password' });
 
-    res.status(200).json({
-      message: 'Logged in successfully',
-      userName: user.name,
-      email: user.email,
-      fuelPrice: user.fuelPrice ?? 0,
-    });
+    res
+      .status(200)
+      .json({
+        message: 'Logged in successfully',
+        userName: user.name,
+        email: user.email,
+        fuelPrice: user.fuelPrice ?? 0,
+      });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Fetch basic profile
 app.get('/user', async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ message: 'Email is required' });
@@ -146,14 +124,13 @@ app.get('/user', async (req, res) => {
   }
 });
 
-// Change email (requires current password)
 app.post('/user/change-email', async (req, res) => {
-  console.log('POST /user/change-email', req.body?.currentEmail);
-  const { currentEmail, password, newEmail } = req.body || {};
-  if (!currentEmail || !password || !newEmail)
+  const { currentEmail, password, newEmail } = req.body;
+  if (!currentEmail || !password || !newEmail) {
     return res
       .status(400)
       .json({ message: 'currentEmail, password and newEmail are required' });
+  }
 
   try {
     const user = await User.findOne({ email: currentEmail });
@@ -176,20 +153,19 @@ app.post('/user/change-email', async (req, res) => {
     res.json({ message: 'Email updated', email: user.email });
   } catch (err) {
     console.error('change-email error:', err);
-    if (err?.code === 11000)
+    if (err.code === 11000)
       return res.status(400).json({ message: 'Email already in use' });
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Change password
 app.post('/user/change-password', async (req, res) => {
-  console.log('POST /user/change-password', req.body?.email);
-  const { email, currentPassword, newPassword } = req.body || {};
-  if (!email || !currentPassword || !newPassword)
+  const { email, currentPassword, newPassword } = req.body;
+  if (!email || !currentPassword || !newPassword) {
     return res
       .status(400)
       .json({ message: 'email, currentPassword and newPassword are required' });
+  }
 
   try {
     const user = await User.findOne({ email });
@@ -209,14 +185,13 @@ app.post('/user/change-password', async (req, res) => {
   }
 });
 
-// Set fuel price
 app.post('/user/fuel-price', async (req, res) => {
-  console.log('POST /user/fuel-price', req.body?.email, req.body?.fuelPrice);
-  const { email, fuelPrice } = req.body || {};
-  if (!email || typeof fuelPrice !== 'number')
+  const { email, fuelPrice } = req.body;
+  if (!email || typeof fuelPrice !== 'number') {
     return res
       .status(400)
       .json({ message: 'email and numeric fuelPrice are required' });
+  }
 
   try {
     const user = await User.findOneAndUpdate(
@@ -233,20 +208,17 @@ app.post('/user/fuel-price', async (req, res) => {
   }
 });
 
-// 404
-app.use((req, res) => {
+// JSON 404
+app.use(function notFound(req, res) {
   res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
 });
 
 // 500
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
+app.use(function onError(err, req, res, next) {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Server error' });
 });
 
-// ---- Start ----
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} [${NODE_ENV}]`);
-  console.log(`Mongo URL: ${MONGO_URL.includes('mongodb') ? 'atlas/local' : 'local'} (hidden)`);
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
