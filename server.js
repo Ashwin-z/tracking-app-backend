@@ -11,93 +11,69 @@ const cors     = require('cors');
 const app = express();
 
 /* ---------- ENV ---------- */
-const PORT        = process.env.PORT || 3000;
-const MONGO_URL   = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const NODE_ENV    = process.env.NODE_ENV || 'development';
-const TRACCAR_SECRET = process.env.TRACCAR_FORWARD_SECRET || '';
-// optional: comma-separated list of IPs allowed to post to the forwarder
-const TRACCAR_IPS = (process.env.TRACCAR_IPS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const PORT            = process.env.PORT || 3000;
+const MONGO_URL       = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
+const CORS_ORIGIN     = process.env.CORS_ORIGIN || '*';
+const NODE_ENV        = process.env.NODE_ENV || 'development';
+const TRACCAR_SECRET  = process.env.TRACCAR_FORWARD_SECRET || '';
+const TRACCAR_IPS     = (process.env.TRACCAR_IPS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 /* ---------- MIDDLEWARE ---------- */
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '5mb' })); // parse JSON bodies
+app.use(express.json({ limit: '5mb' })); 
 
-const corsOptions = {
+app.use(cors({
   origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map(s => s.trim()),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+}));
 
 /* ---------- MONGODB ---------- */
 mongoose.set('strictQuery', true);
-mongoose
-  .connect(MONGO_URL, { serverSelectionTimeoutMS: 8000 })
-  .then(() => console.log('MongoDB connected successfully'))
-  .catch(err => console.error('MongoDB connection error:', err.message));
-
-mongoose.connection.on('disconnected', () =>
-  console.warn('MongoDB disconnected')
-);
+mongoose.connect(MONGO_URL, { serverSelectionTimeoutMS: 8000 })
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
 /* ---------- MODELS ---------- */
-// Users (existing)
-const userSchema = new mongoose.Schema(
-  {
-    name:      { type: String, required: true },
-    email:     { type: String, required: true, unique: true, index: true },
-    password:  { type: String, required: true },
-    fuelPrice: { type: Number, default: 0 },
-  },
-  { timestamps: true }
-);
+// Users
+const userSchema = new mongoose.Schema({
+  name:      { type: String, required: true },
+  email:     { type: String, required: true, unique: true, index: true },
+  password:  { type: String, required: true },
+  fuelPrice: { type: Number, default: 0 },
+}, { timestamps: true });
 const User = mongoose.model('User', userSchema);
 
-// Positions (from Traccar)
-const positionSchema = new mongoose.Schema(
-  {
-    deviceId: { type: Number, index: true },
-    protocol: String,
-
-    serverTime: Date,
-    deviceTime: Date,
-    fixTime:    { type: Date, index: true },
-
-    valid: Boolean,
-    latitude: Number,
-    longitude: Number,
-    altitude: Number,
-    speed: Number,
-    course: Number,
-    accuracy: Number,
-
-    address: String,
-    attributes: mongoose.Schema.Types.Mixed,
-
-    raw: mongoose.Schema.Types.Mixed, // keep full original just in case
-  },
-  { timestamps: true, strict: false }
-);
+// Positions
+const positionSchema = new mongoose.Schema({
+  deviceId: { type: Number, index: true },
+  protocol: String,
+  serverTime: Date,
+  deviceTime: Date,
+  fixTime:    { type: Date, index: true },
+  valid: Boolean,
+  latitude: Number,
+  longitude: Number,
+  altitude: Number,
+  speed: Number,
+  course: Number,
+  accuracy: Number,
+  address: String,
+  attributes: mongoose.Schema.Types.Mixed,
+  raw: mongoose.Schema.Types.Mixed,
+}, { timestamps: true });
 positionSchema.index({ deviceId: 1, fixTime: -1 });
 const Position = mongoose.model('Position', positionSchema);
 
-// Events (optional — when event.forward.enable=true)
-const eventSchema = new mongoose.Schema(
-  {
-    deviceId: { type: Number, index: true },
-    type: String,         // e.g. geofenceEnter, ignitionOn
-    eventTime: Date,
-    positionId: Number,   // Traccar numeric position id (if present)
-    attributes: mongoose.Schema.Types.Mixed,
-    raw: mongoose.Schema.Types.Mixed,
-  },
-  { timestamps: true, strict: false }
-);
+// Events
+const eventSchema = new mongoose.Schema({
+  deviceId: { type: Number, index: true },
+  type: String,
+  eventTime: Date,
+  positionId: Number,
+  attributes: mongoose.Schema.Types.Mixed,
+  raw: mongoose.Schema.Types.Mixed,
+}, { timestamps: true });
 eventSchema.index({ deviceId: 1, eventTime: -1 });
 const Event = mongoose.model('Event', eventSchema);
 
@@ -107,320 +83,126 @@ const sanitizeUser = u => ({
   email: u.email,
   fuelPrice: u.fuelPrice ?? 0,
 });
-
 function clientIp(req) {
   const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return xf || req.ip || req.connection?.remoteAddress || '';
+  return xf || req.ip || '';
 }
-
 function ensureNumber(n) {
-  if (n === null || n === undefined || n === '') return undefined;
-  const x = Number(n);
-  return Number.isNaN(x) ? undefined : x;
+  const x = Number(n); return Number.isNaN(x) ? undefined : x;
 }
-
 function toDate(v) {
-  if (!v) return undefined;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? undefined : d;
+  const d = new Date(v); return isNaN(d.getTime()) ? undefined : d;
 }
 
-/* ---------- ROUTES: HEALTH ---------- */
+/* ---------- ROUTES ---------- */
+// Health
 app.get('/health', (req, res) => {
-  res.status(200).json({
+  res.json({
     status: 'Server is running',
     env: NODE_ENV,
     mongo: mongoose.connection.readyState === 1 ? 'connected' : 'not-connected',
   });
 });
 
-/* ---------- AUTH / PROFILE (existing) ---------- */
-// Register
+// Registration
 app.post('/register', async (req, res) => {
-  console.log('POST /register', req.body?.email);
   const { name, email, password } = req.body || {};
-  if (!name || !email || !password)
-    return res.status(400).json({ message: 'Please fill in all fields' });
-
+  if (!name || !email || !password) return res.status(400).json({ message: 'Please fill in all fields' });
   try {
-    const existingUser = await User.findOne({ email });
-    if (existingUser) return res.status(400).json({ message: 'Email already exists' });
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
+    if (await User.findOne({ email })) return res.status(400).json({ message: 'Email already exists' });
+    const hashedPassword = await bcrypt.hash(password, 10);
     const newUser = await User.create({ name, email, password: hashedPassword });
-    res.status(201).json({
-      message: `Welcome ${name}! Account created successfully.`,
-      ...sanitizeUser(newUser),
-    });
-  } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+    res.status(201).json({ message: `Welcome ${name}!`, ...sanitizeUser(newUser) });
+  } catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
 // Login
 app.post('/login', async (req, res) => {
-  console.log('POST /login', req.body?.email);
   const { email, password } = req.body || {};
-  if (!email || !password)
-    return res.status(400).json({ message: 'Please fill in all fields' });
-
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: 'Invalid email or password' });
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Invalid email or password' });
-
-    res.status(200).json({
-      message: 'Logged in successfully',
-      userName: user.name,
-      email: user.email,
-      fuelPrice: user.fuelPrice ?? 0,
-    });
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Get profile
-app.get('/user', async (req, res) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ message: 'Email is required' });
-  try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    res.json(sanitizeUser(user));
-  } catch (err) {
-    console.error('GET /user error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Change email
-app.post('/user/change-email', async (req, res) => {
-  console.log('POST /user/change-email', req.body?.currentEmail);
-  const { currentEmail, password, newEmail } = req.body || {};
-  if (!currentEmail || !password || !newEmail)
-    return res.status(400).json({ message: 'currentEmail, password and newEmail are required' });
-
-  try {
-    const user = await User.findOne({ email: currentEmail });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
     const ok = await bcrypt.compare(password, user.password);
-    if (!ok) return res.status(400).json({ message: 'Incorrect password' });
-
-    if (currentEmail === newEmail)
-      return res.status(400).json({ message: 'New email is the same as current' });
-
-    const exists = await User.findOne({ email: newEmail });
-    if (exists) return res.status(400).json({ message: 'New email already in use' });
-
-    user.email = newEmail;
-    await user.save();
-
-    res.json({ message: 'Email updated', email: user.email });
-  } catch (err) {
-    console.error('change-email error:', err);
-    if (err?.code === 11000)
-      return res.status(400).json({ message: 'Email already in use' });
-    res.status(500).json({ message: 'Server error' });
-  }
+    if (!ok) return res.status(400).json({ message: 'Invalid email or password' });
+    res.json({ message: 'Logged in', userName: user.name, email: user.email, fuelPrice: user.fuelPrice ?? 0 });
+  } catch { res.status(500).json({ message: 'Server error' }); }
 });
 
-// Change password
-app.post('/user/change-password', async (req, res) => {
-  console.log('POST /user/change-password', req.body?.email);
-  const { email, currentPassword, newPassword } = req.body || {};
-  if (!email || !currentPassword || !newPassword)
-    return res.status(400).json({ message: 'email, currentPassword and newPassword are required' });
-
-  try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const ok = await bcrypt.compare(currentPassword, user.password);
-    if (!ok) return res.status(400).json({ message: 'Incorrect current password' });
-
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(newPassword, salt);
-    await user.save();
-
-    res.json({ message: 'Password updated' });
-  } catch (err) {
-    console.error('change-password error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Set fuel price
-app.post('/user/fuel-price', async (req, res) => {
-  console.log('POST /user/fuel-price', req.body?.email, req.body?.fuelPrice);
-  const { email, fuelPrice } = req.body || {};
-  if (!email || typeof fuelPrice !== 'number')
-    return res.status(400).json({ message: 'email and numeric fuelPrice are required' });
-
-  try {
-    const user = await User.findOneAndUpdate(
-      { email },
-      { $set: { fuelPrice } },
-      { new: true }
-    );
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    res.json({ message: 'Fuel price saved', fuelPrice: user.fuelPrice });
-  } catch (err) {
-    console.error('fuel-price error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-/* ---------- TRACCAR FORWARDER ---------- */
-// Traccar will POST JSON here when you set forward.url + forward.json=true
+// 🔥 Traccar Forward Endpoint
 app.post('/traccar/forward', async (req, res) => {
   try {
-    // 1) Secret check
-    const given =
-      req.query.secret ||
-      req.headers['x-traccar-secret'] ||
-      req.headers['x-forward-secret'];
+    // secret check
+    const given = req.query.secret || req.headers['x-traccar-secret'];
+    if (given !== TRACCAR_SECRET) return res.status(401).json({ ok: false, error: 'bad-secret' });
 
-    if (!TRACCAR_SECRET || given !== TRACCAR_SECRET) {
-      return res.status(401).json({ ok: false, error: 'bad-secret' });
+    // optional IP restriction
+    if (TRACCAR_IPS.length && !TRACCAR_IPS.includes(clientIp(req))) {
+      return res.status(403).json({ ok: false, error: 'ip-not-allowed' });
     }
 
-    // 2) Optional IP allow list
-    if (TRACCAR_IPS.length) {
-      const ip = clientIp(req);
-      const allowed = TRACCAR_IPS.includes(ip);
-      if (!allowed) return res.status(403).json({ ok: false, error: 'ip-not-allowed', ip });
-    }
+    const payload = Array.isArray(req.body) ? req.body : [req.body];
+    const positions = [], events = [];
 
-    // 3) Normalize payload into arrays of positions/events
-    const payload = req.body;
-    const items = Array.isArray(payload) ? payload : [payload];
-
-    const positions = [];
-    const events = [];
-
-    for (const it of items) {
-      if (!it || typeof it !== 'object') continue;
-
-      // Event forward payload: { event: {...}, position: {...}, device: {...} }
+    for (const it of payload) {
       if (it.event) {
-        const ev = it.event || {};
-        const pos = it.position || {};
         events.push({
-          deviceId: ensureNumber(ev.deviceId ?? pos.deviceId ?? it.deviceId),
-          type: ev.type,
-          eventTime: toDate(ev.eventTime ?? ev.serverTime ?? pos.serverTime),
-          positionId: ensureNumber(ev.positionId),
-          attributes: ev.attributes || {},
+          deviceId: ensureNumber(it.event.deviceId),
+          type: it.event.type,
+          eventTime: toDate(it.event.eventTime),
+          positionId: ensureNumber(it.event.positionId),
+          attributes: it.event.attributes || {},
           raw: it,
         });
-
-        // also persist its position (if present)
-        if (pos && (pos.latitude !== undefined && pos.longitude !== undefined)) {
-          positions.push(pos);
-        }
-        continue;
-      }
-
-      // Position forward payload (most common)
-      const pos = it.position || it;
-      if (pos && pos.latitude !== undefined && pos.longitude !== undefined) {
-        positions.push(pos);
+        if (it.position?.latitude) positions.push(it.position);
+      } else if (it.latitude && it.longitude) {
+        positions.push(it);
       }
     }
 
-    // 4) Save to DB (ignore duplicates/errors individually)
-    let savedPos = 0;
-    let savedEvt = 0;
+    if (positions.length) await Position.insertMany(positions.map(p => ({
+      deviceId: ensureNumber(p.deviceId ?? p.device?.id),
+      protocol: p.protocol,
+      serverTime: toDate(p.serverTime),
+      deviceTime: toDate(p.deviceTime),
+      fixTime: toDate(p.fixTime),
+      valid: !!p.valid,
+      latitude: ensureNumber(p.latitude),
+      longitude: ensureNumber(p.longitude),
+      speed: ensureNumber(p.speed),
+      address: p.address,
+      attributes: p.attributes || {},
+      raw: p,
+    })), { ordered: false });
 
-    if (positions.length) {
-      const docs = positions.map(p => ({
-        deviceId: ensureNumber(p.deviceId ?? p.device?.id),
-        protocol: p.protocol,
-        serverTime: toDate(p.serverTime),
-        deviceTime: toDate(p.deviceTime),
-        fixTime: toDate(p.fixTime),
-        valid: !!p.valid,
-        latitude: ensureNumber(p.latitude),
-        longitude: ensureNumber(p.longitude),
-        altitude: ensureNumber(p.altitude),
-        speed: ensureNumber(p.speed),
-        course: ensureNumber(p.course),
-        accuracy: ensureNumber(p.accuracy),
-        address: p.address,
-        attributes: p.attributes || {},
-        raw: p,
-      }));
-      const resIns = await Position.insertMany(docs, { ordered: false });
-      savedPos = resIns.length;
-    }
+    if (events.length) await Event.insertMany(events, { ordered: false });
 
-    if (events.length) {
-      const resEvt = await Event.insertMany(events, { ordered: false });
-      savedEvt = resEvt.length;
-    }
-
-    // 5) Respond OK (Traccar just needs 200)
-    return res.json({ ok: true, positions: savedPos, events: savedEvt });
+    res.json({ ok: true, positions: positions.length, events: events.length });
   } catch (e) {
-    console.error('traccar/forward error:', e);
-    return res.status(500).json({ ok: false });
+    console.error('forward error:', e);
+    res.status(500).json({ ok: false });
   }
 });
 
-/* ---------- SIMPLE READ APIS FOR APP ---------- */
-// Latest positions (optionally by deviceId)
+// Latest position
 app.get('/positions/latest', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
-    const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
-    const q = deviceId ? { deviceId } : {};
-    const docs = await Position.find(q).sort({ fixTime: -1, createdAt: -1 }).limit(limit);
-    res.json({ ok: true, count: docs.length, data: docs });
-  } catch (e) {
-    console.error('GET /positions/latest error:', e);
-    res.status(500).json({ ok: false });
-  }
+  const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
+  const q = deviceId ? { deviceId } : {};
+  const docs = await Position.find(q).sort({ fixTime: -1 }).limit(20);
+  res.json(docs);
 });
 
-// Latest event(s)
+// Latest events
 app.get('/events/latest', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
-    const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
-    const q = deviceId ? { deviceId } : {};
-    const docs = await Event.find(q).sort({ eventTime: -1, createdAt: -1 }).limit(limit);
-    res.json({ ok: true, count: docs.length, data: docs });
-  } catch (e) {
-    console.error('GET /events/latest error:', e);
-    res.status(500).json({ ok: false });
-  }
+  const docs = await Event.find({}).sort({ eventTime: -1 }).limit(20);
+  res.json(docs);
 });
 
-/* ---------- 404 & 500 ---------- */
-app.use((req, res) => {
-  res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
-});
-
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ message: 'Server error' });
-});
+/* ---------- ERROR HANDLERS ---------- */
+app.use((req, res) => res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` }));
+app.use((err, req, res, next) => { console.error(err); res.status(500).json({ message: 'Server error' }); });
 
 /* ---------- START ---------- */
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} [${NODE_ENV}]`);
-  console.log(`Mongo URL: ${MONGO_URL.includes('mongodb') ? 'atlas/local' : 'local'} (hidden)`);
-  if (!TRACCAR_SECRET) {
-    console.warn('⚠️  TRACCAR_FORWARD_SECRET is not set — /traccar/forward will reject all posts.');
-  }
+  console.log(`🚀 Server running on port ${PORT} [${NODE_ENV}]`);
+  if (!TRACCAR_SECRET) console.warn('⚠️  TRACCAR_FORWARD_SECRET not set, will reject Traccar posts.');
 });
