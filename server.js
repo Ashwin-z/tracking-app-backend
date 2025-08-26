@@ -1,55 +1,52 @@
 // backend/server.js
-// Env-ready Express API for car-tracker
+// Env-ready Express API for car-tracker + Traccar forwarder
 
-// 1) Load env (local only—hosted platforms inject env themselves)
 try { require('dotenv').config(); } catch (_) {}
 
-const express = require('express');
+const express  = require('express');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const cors = require('cors');
+const bcrypt   = require('bcryptjs');
+const cors     = require('cors');
 
 const app = express();
 
-// ---- ENV ----
+/* ---------- ENV ---------- */
 const PORT        = process.env.PORT || 3000;
 const MONGO_URL   = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const NODE_ENV    = process.env.NODE_ENV || 'development';
+const TRACCAR_SECRET = process.env.TRACCAR_FORWARD_SECRET || '';
+// optional: comma-separated list of IPs allowed to post to the forwarder
+const TRACCAR_IPS = (process.env.TRACCAR_IPS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// ---- Middleware ----
-app.set('trust proxy', 1); // needed if behind a proxy (Render/Heroku)
-app.use(express.json());   // replaces body-parser for JSON
+/* ---------- MIDDLEWARE ---------- */
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '5mb' })); // parse JSON bodies
 
 const corsOptions = {
-  origin:
-    CORS_ORIGIN === '*'
-      ? true // allow all (no credentials)
-      : CORS_ORIGIN.split(',').map(s => s.trim()),
+  origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map(s => s.trim()),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // preflight
+app.options('*', cors(corsOptions));
 
-// ---- MongoDB ----
+/* ---------- MONGODB ---------- */
 mongoose.set('strictQuery', true);
 mongoose
-  .connect(MONGO_URL, {
-    // modern mongoose doesn’t require useNewUrlParser/useUnifiedTopology
-    serverSelectionTimeoutMS: 8000,
-  })
+  .connect(MONGO_URL, { serverSelectionTimeoutMS: 8000 })
   .then(() => console.log('MongoDB connected successfully'))
-  .catch(err => {
-    console.error('MongoDB connection error:', err.message);
-    // don’t exit; app can still serve health/errors to aid debugging
-  });
+  .catch(err => console.error('MongoDB connection error:', err.message));
 
 mongoose.connection.on('disconnected', () =>
   console.warn('MongoDB disconnected')
 );
 
-// ---- Models ----
+/* ---------- MODELS ---------- */
+// Users (existing)
 const userSchema = new mongoose.Schema(
   {
     name:      { type: String, required: true },
@@ -61,16 +58,74 @@ const userSchema = new mongoose.Schema(
 );
 const User = mongoose.model('User', userSchema);
 
-// ---- Helpers ----
+// Positions (from Traccar)
+const positionSchema = new mongoose.Schema(
+  {
+    deviceId: { type: Number, index: true },
+    protocol: String,
+
+    serverTime: Date,
+    deviceTime: Date,
+    fixTime:    { type: Date, index: true },
+
+    valid: Boolean,
+    latitude: Number,
+    longitude: Number,
+    altitude: Number,
+    speed: Number,
+    course: Number,
+    accuracy: Number,
+
+    address: String,
+    attributes: mongoose.Schema.Types.Mixed,
+
+    raw: mongoose.Schema.Types.Mixed, // keep full original just in case
+  },
+  { timestamps: true, strict: false }
+);
+positionSchema.index({ deviceId: 1, fixTime: -1 });
+const Position = mongoose.model('Position', positionSchema);
+
+// Events (optional — when event.forward.enable=true)
+const eventSchema = new mongoose.Schema(
+  {
+    deviceId: { type: Number, index: true },
+    type: String,         // e.g. geofenceEnter, ignitionOn
+    eventTime: Date,
+    positionId: Number,   // Traccar numeric position id (if present)
+    attributes: mongoose.Schema.Types.Mixed,
+    raw: mongoose.Schema.Types.Mixed,
+  },
+  { timestamps: true, strict: false }
+);
+eventSchema.index({ deviceId: 1, eventTime: -1 });
+const Event = mongoose.model('Event', eventSchema);
+
+/* ---------- HELPERS ---------- */
 const sanitizeUser = u => ({
   name: u.name,
   email: u.email,
   fuelPrice: u.fuelPrice ?? 0,
 });
 
-// ---- Routes ----
+function clientIp(req) {
+  const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xf || req.ip || req.connection?.remoteAddress || '';
+}
 
-// Health + meta
+function ensureNumber(n) {
+  if (n === null || n === undefined || n === '') return undefined;
+  const x = Number(n);
+  return Number.isNaN(x) ? undefined : x;
+}
+
+function toDate(v) {
+  if (!v) return undefined;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
+/* ---------- ROUTES: HEALTH ---------- */
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'Server is running',
@@ -79,7 +134,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Registration
+/* ---------- AUTH / PROFILE (existing) ---------- */
+// Register
 app.post('/register', async (req, res) => {
   console.log('POST /register', req.body?.email);
   const { name, email, password } = req.body || {};
@@ -88,16 +144,16 @@ app.post('/register', async (req, res) => {
 
   try {
     const existingUser = await User.findOne({ email });
-    if (existingUser)
-      return res.status(400).json({ message: 'Email already exists' });
+    if (existingUser) return res.status(400).json({ message: 'Email already exists' });
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const newUser = await User.create({ name, email, password: hashedPassword });
-    res
-      .status(201)
-      .json({ message: `Welcome ${name}! Account created successfully.`, ...sanitizeUser(newUser) });
+    res.status(201).json({
+      message: `Welcome ${name}! Account created successfully.`,
+      ...sanitizeUser(newUser),
+    });
   } catch (err) {
     console.error('Registration error:', err);
     res.status(500).json({ message: 'Server error' });
@@ -113,12 +169,10 @@ app.post('/login', async (req, res) => {
 
   try {
     const user = await User.findOne({ email });
-    if (!user)
-      return res.status(400).json({ message: 'Invalid email or password' });
+    if (!user) return res.status(400).json({ message: 'Invalid email or password' });
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch)
-      return res.status(400).json({ message: 'Invalid email or password' });
+    if (!isMatch) return res.status(400).json({ message: 'Invalid email or password' });
 
     res.status(200).json({
       message: 'Logged in successfully',
@@ -132,7 +186,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Fetch basic profile
+// Get profile
 app.get('/user', async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ message: 'Email is required' });
@@ -146,14 +200,12 @@ app.get('/user', async (req, res) => {
   }
 });
 
-// Change email (requires current password)
+// Change email
 app.post('/user/change-email', async (req, res) => {
   console.log('POST /user/change-email', req.body?.currentEmail);
   const { currentEmail, password, newEmail } = req.body || {};
   if (!currentEmail || !password || !newEmail)
-    return res
-      .status(400)
-      .json({ message: 'currentEmail, password and newEmail are required' });
+    return res.status(400).json({ message: 'currentEmail, password and newEmail are required' });
 
   try {
     const user = await User.findOne({ email: currentEmail });
@@ -163,9 +215,7 @@ app.post('/user/change-email', async (req, res) => {
     if (!ok) return res.status(400).json({ message: 'Incorrect password' });
 
     if (currentEmail === newEmail)
-      return res
-        .status(400)
-        .json({ message: 'New email is the same as current' });
+      return res.status(400).json({ message: 'New email is the same as current' });
 
     const exists = await User.findOne({ email: newEmail });
     if (exists) return res.status(400).json({ message: 'New email already in use' });
@@ -187,9 +237,7 @@ app.post('/user/change-password', async (req, res) => {
   console.log('POST /user/change-password', req.body?.email);
   const { email, currentPassword, newPassword } = req.body || {};
   if (!email || !currentPassword || !newPassword)
-    return res
-      .status(400)
-      .json({ message: 'email, currentPassword and newPassword are required' });
+    return res.status(400).json({ message: 'email, currentPassword and newPassword are required' });
 
   try {
     const user = await User.findOne({ email });
@@ -214,9 +262,7 @@ app.post('/user/fuel-price', async (req, res) => {
   console.log('POST /user/fuel-price', req.body?.email, req.body?.fuelPrice);
   const { email, fuelPrice } = req.body || {};
   if (!email || typeof fuelPrice !== 'number')
-    return res
-      .status(400)
-      .json({ message: 'email and numeric fuelPrice are required' });
+    return res.status(400).json({ message: 'email and numeric fuelPrice are required' });
 
   try {
     const user = await User.findOneAndUpdate(
@@ -233,20 +279,148 @@ app.post('/user/fuel-price', async (req, res) => {
   }
 });
 
-// 404
+/* ---------- TRACCAR FORWARDER ---------- */
+// Traccar will POST JSON here when you set forward.url + forward.json=true
+app.post('/traccar/forward', async (req, res) => {
+  try {
+    // 1) Secret check
+    const given =
+      req.query.secret ||
+      req.headers['x-traccar-secret'] ||
+      req.headers['x-forward-secret'];
+
+    if (!TRACCAR_SECRET || given !== TRACCAR_SECRET) {
+      return res.status(401).json({ ok: false, error: 'bad-secret' });
+    }
+
+    // 2) Optional IP allow list
+    if (TRACCAR_IPS.length) {
+      const ip = clientIp(req);
+      const allowed = TRACCAR_IPS.includes(ip);
+      if (!allowed) return res.status(403).json({ ok: false, error: 'ip-not-allowed', ip });
+    }
+
+    // 3) Normalize payload into arrays of positions/events
+    const payload = req.body;
+    const items = Array.isArray(payload) ? payload : [payload];
+
+    const positions = [];
+    const events = [];
+
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+
+      // Event forward payload: { event: {...}, position: {...}, device: {...} }
+      if (it.event) {
+        const ev = it.event || {};
+        const pos = it.position || {};
+        events.push({
+          deviceId: ensureNumber(ev.deviceId ?? pos.deviceId ?? it.deviceId),
+          type: ev.type,
+          eventTime: toDate(ev.eventTime ?? ev.serverTime ?? pos.serverTime),
+          positionId: ensureNumber(ev.positionId),
+          attributes: ev.attributes || {},
+          raw: it,
+        });
+
+        // also persist its position (if present)
+        if (pos && (pos.latitude !== undefined && pos.longitude !== undefined)) {
+          positions.push(pos);
+        }
+        continue;
+      }
+
+      // Position forward payload (most common)
+      const pos = it.position || it;
+      if (pos && pos.latitude !== undefined && pos.longitude !== undefined) {
+        positions.push(pos);
+      }
+    }
+
+    // 4) Save to DB (ignore duplicates/errors individually)
+    let savedPos = 0;
+    let savedEvt = 0;
+
+    if (positions.length) {
+      const docs = positions.map(p => ({
+        deviceId: ensureNumber(p.deviceId ?? p.device?.id),
+        protocol: p.protocol,
+        serverTime: toDate(p.serverTime),
+        deviceTime: toDate(p.deviceTime),
+        fixTime: toDate(p.fixTime),
+        valid: !!p.valid,
+        latitude: ensureNumber(p.latitude),
+        longitude: ensureNumber(p.longitude),
+        altitude: ensureNumber(p.altitude),
+        speed: ensureNumber(p.speed),
+        course: ensureNumber(p.course),
+        accuracy: ensureNumber(p.accuracy),
+        address: p.address,
+        attributes: p.attributes || {},
+        raw: p,
+      }));
+      const resIns = await Position.insertMany(docs, { ordered: false });
+      savedPos = resIns.length;
+    }
+
+    if (events.length) {
+      const resEvt = await Event.insertMany(events, { ordered: false });
+      savedEvt = resEvt.length;
+    }
+
+    // 5) Respond OK (Traccar just needs 200)
+    return res.json({ ok: true, positions: savedPos, events: savedEvt });
+  } catch (e) {
+    console.error('traccar/forward error:', e);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+/* ---------- SIMPLE READ APIS FOR APP ---------- */
+// Latest positions (optionally by deviceId)
+app.get('/positions/latest', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
+    const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
+    const q = deviceId ? { deviceId } : {};
+    const docs = await Position.find(q).sort({ fixTime: -1, createdAt: -1 }).limit(limit);
+    res.json({ ok: true, count: docs.length, data: docs });
+  } catch (e) {
+    console.error('GET /positions/latest error:', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// Latest event(s)
+app.get('/events/latest', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
+    const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
+    const q = deviceId ? { deviceId } : {};
+    const docs = await Event.find(q).sort({ eventTime: -1, createdAt: -1 }).limit(limit);
+    res.json({ ok: true, count: docs.length, data: docs });
+  } catch (e) {
+    console.error('GET /events/latest error:', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* ---------- 404 & 500 ---------- */
 app.use((req, res) => {
   res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
 });
 
-// 500
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Server error' });
 });
 
-// ---- Start ----
+/* ---------- START ---------- */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT} [${NODE_ENV}]`);
   console.log(`Mongo URL: ${MONGO_URL.includes('mongodb') ? 'atlas/local' : 'local'} (hidden)`);
+  if (!TRACCAR_SECRET) {
+    console.warn('⚠️  TRACCAR_FORWARD_SECRET is not set — /traccar/forward will reject all posts.');
+  }
 });
