@@ -17,9 +17,12 @@ const CORS_ORIGIN       = process.env.CORS_ORIGIN || '*';
 const NODE_ENV          = process.env.NODE_ENV || 'development';
 const TRACCAR_SECRET    = process.env.TRACCAR_FORWARD_SECRET || ''; // REQUIRED in production
 const TRACCAR_IPS       = (process.env.TRACCAR_IPS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// NEW: Traccar API creds (for live device.status + name)
+const TRACCAR_BASE_URL  = (process.env.TRACCAR_BASE_URL || '').replace(/\/+$/, '');
+const TRACCAR_USER      = process.env.TRACCAR_USER || '';
+const TRACCAR_PASS      = process.env.TRACCAR_PASS || '';
 
 /* ---------- MIDDLEWARE ---------- */
 app.set('trust proxy', 1);
@@ -122,7 +125,93 @@ function toDate(v) {
   return isNaN(d.getTime()) ? undefined : d;
 }
 
-/* ---------- HEALTH ---------- */
+/* ============ NEW: Traccar API proxy + geocoder ============ */
+
+// build Basic Auth once
+function traccarAuthHeader() {
+  return 'Basic ' + Buffer.from(`${TRACCAR_USER}:${TRACCAR_PASS}`).toString('base64');
+}
+
+/**
+ * GET /proxy/traccar/devices
+ * Returns [{ id, uniqueId, name, status }]
+ * Uses your VPS Traccar API (80.190.80.82/api)
+ */
+app.get('/proxy/traccar/devices', async (req, res) => {
+  try {
+    if (!TRACCAR_BASE_URL || !TRACCAR_USER) {
+      return res.json({ ok: false, error: 'not-configured', data: [] });
+    }
+    const r = await fetch(`${TRACCAR_BASE_URL}/devices`, {
+      headers: {
+        Authorization: traccarAuthHeader(),
+        Accept: 'application/json',
+      },
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      console.error('Traccar /devices failed', r.status, text);
+      return res.status(502).json({ ok: false });
+    }
+    const data = await r.json();
+    const out = (Array.isArray(data) ? data : []).map(d => ({
+      id: d.id, uniqueId: d.uniqueId, name: d.name, status: (d.status || '').toLowerCase(),
+    }));
+    res.json({ ok: true, count: out.length, data: out });
+  } catch (e) {
+    console.error('proxy devices error:', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// very small in-memory cache for geocode
+const _geoCache = new Map(); // key -> { label, ts }
+function _addrShort(json) {
+  const a = json?.address || {};
+  const city = a.city || a.town || a.village || a.hamlet || a.suburb || a.neighbourhood;
+  const region = a.state || a.county || a.state_district || a.region || a.province;
+  const cc = (a.country_code || '').toUpperCase();
+  if (city && region && cc) return `${city}, ${region}, ${cc}`;
+  if (city && region) return `${city}, ${region}`;
+  if (city && cc) return `${city}, ${cc}`;
+  if (region && cc) return `${region}, ${cc}`;
+  return json?.display_name || null;
+}
+
+/**
+ * GET /geocode?lat=..&lon=..
+ * Returns { ok: true, label: "Latifabad, Sindh, PK" }
+ */
+app.get('/geocode', async (req, res) => {
+  const lat = Number(req.query.lat), lon = Number(req.query.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return res.status(400).json({ ok: false, error: 'bad-params' });
+  }
+  const key = `${lat.toFixed(4)}:${lon.toFixed(4)}`;
+  const cached = _geoCache.get(key);
+  const now = Date.now();
+  if (cached && (now - cached.ts < 1000 * 60 * 60 * 24 * 7)) { // 7 days
+    return res.json({ ok: true, label: cached.label, cached: true });
+  }
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&addressdetails=1`;
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'CarTrackerApp/1.0 (admin@example.com)',
+        'Accept-Language': 'en',
+      },
+    });
+    const j = await r.json();
+    const label = _addrShort(j) || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    _geoCache.set(key, { label, ts: now });
+    if (_geoCache.size > 400) _geoCache.delete(_geoCache.keys().next().value);
+    res.json({ ok: true, label });
+  } catch {
+    res.json({ ok: true, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}` });
+  }
+});
+
+/* -------------------- HEALTH -------------------- */
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'Server is running',
@@ -314,7 +403,6 @@ app.post('/traccar/forward', async (req, res) => {
         });
 
         if (pos && (pos.latitude !== undefined && pos.longitude !== undefined)) {
-          // ensure reasonable defaults
           positions.push({
             ...pos,
             fixTime: pos.fixTime || pos.deviceTime || pos.serverTime || new Date().toISOString(),
@@ -392,7 +480,7 @@ app.get('/positions/latest', async (req, res) => {
     const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
     const q = deviceId ? { deviceId } : {};
     const docs = await Position.find(q).sort({ fixTime: -1, createdAt: -1 }).limit(limit);
-    res.json(docs); // keep raw array for RN code you already wrote
+    res.json(docs); // raw array (your RN code expects it)
   } catch (e) {
     console.error('GET /positions/latest error:', e);
     res.status(500).json({ ok: false });
@@ -429,5 +517,8 @@ app.listen(PORT, () => {
   console.log(`Mongo URL: ${MONGO_URL.includes('mongodb') ? 'atlas/local' : 'local'} (hidden)`);
   if (!TRACCAR_SECRET) {
     console.warn('⚠️  TRACCAR_FORWARD_SECRET is not set — /traccar/forward will reject all posts.');
+  }
+  if (!TRACCAR_BASE_URL) {
+    console.warn('ℹ️  TRACCAR_BASE_URL not set — /proxy/traccar/devices will return not-configured.');
   }
 });
