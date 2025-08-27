@@ -1,5 +1,5 @@
 // backend/server.js
-// Env-ready Express API for car-tracker + Traccar forwarder
+// Env-ready Express API for car-tracker + Traccar forwarder + live tail + per-device latest
 
 try { require('dotenv').config(); } catch (_) {}
 
@@ -16,10 +16,11 @@ const MONGO_URL         = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/ca
 const CORS_ORIGIN       = process.env.CORS_ORIGIN || '*';
 const NODE_ENV          = process.env.NODE_ENV || 'development';
 const TRACCAR_SECRET    = process.env.TRACCAR_FORWARD_SECRET || ''; // REQUIRED in production
-const TRACCAR_IPS       = (process.env.TRACCAR_IPS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const TRACCAR_IPS       = (process.env.TRACCAR_IPS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+// live tail toggles (for Render logs)
+const ENABLE_RENDER_TAIL = (process.env.ENABLE_RENDER_TAIL || 'false').toLowerCase() === 'true';
+const TAIL_EVERY_MS      = Number(process.env.TAIL_EVERY_MS || 10000);
 
 /* ---------- MIDDLEWARE ---------- */
 app.set('trust proxy', 1);
@@ -121,6 +122,46 @@ function toDate(v) {
   const d = new Date(v);
   return isNaN(d.getTime()) ? undefined : d;
 }
+
+// --- live classification & formatting ---
+const SPEED_RUNNING_KMH = 3;
+
+const truthy = (v) =>
+  v === true || v === 'true' || v === 1 || v === '1' || v === 'on' || v === 'ON';
+
+const toDateOrEpoch = (v) => toDate(v) || new Date(0);
+const minutesSince = (d) => (Date.now() - d.getTime()) / 60000;
+
+const readIgnition = (attrs = {}, speed = 0, motion) => {
+  const direct =
+    attrs.ignition ?? attrs.acc ?? attrs.engine ?? attrs.Ignition ?? attrs.IGN;
+  if (direct !== undefined) return truthy(direct);
+  if (motion === true || Number(speed) > SPEED_RUNNING_KMH) return true;
+  if (motion === false || Number(speed) <= SPEED_RUNNING_KMH) return false;
+  return null;
+};
+
+// Your rule: if speed ≤ 3 and motion != true ⇒ treat as STOPPED/PARKED (even if old)
+const classifyFromPosition = (pos) => {
+  const a = pos.attributes || {};
+  const speed = Number(pos.speed || 0);
+  const motion = a.motion;
+  const ign = readIgnition(a, speed, motion);
+
+  if (speed <= SPEED_RUNNING_KMH && motion !== true) return 'stopped';
+  if (speed > SPEED_RUNNING_KMH || motion === true) return 'running';
+  if (ign === true) return 'idle';
+  return 'stopped';
+};
+
+const shortAddress = (line) => {
+  if (!line) return '';
+  const parts = String(line).split(',').map(s => s.trim()).filter(Boolean);
+  return parts.slice(-3).join(', ').replace(/Pakistan$/i, 'PK');
+};
+
+const whenOf = (p) =>
+  toDate(p.fixTime || p.deviceTime || p.serverTime || p.createdAt) || new Date(0);
 
 /* ---------- HEALTH ---------- */
 app.get('/health', (req, res) => {
@@ -314,7 +355,6 @@ app.post('/traccar/forward', async (req, res) => {
         });
 
         if (pos && (pos.latitude !== undefined && pos.longitude !== undefined)) {
-          // ensure reasonable defaults
           positions.push({
             ...pos,
             fixTime: pos.fixTime || pos.deviceTime || pos.serverTime || new Date().toISOString(),
@@ -333,7 +373,7 @@ app.post('/traccar/forward', async (req, res) => {
       }
     }
 
-    // Debug: log brief sample
+    // Debug: brief sample
     const now = new Date().toISOString();
     const sample = positions[0] || (events[0]?.position) || null;
     console.log(
@@ -386,19 +426,21 @@ app.post('/traccar/forward', async (req, res) => {
 });
 
 /* ---------- SIMPLE READ APIS FOR APP ---------- */
+// Raw latest positions (array)
 app.get('/positions/latest', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
     const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
     const q = deviceId ? { deviceId } : {};
     const docs = await Position.find(q).sort({ fixTime: -1, createdAt: -1 }).limit(limit);
-    res.json(docs); // keep raw array for RN code you already wrote
+    res.json(docs);
   } catch (e) {
     console.error('GET /positions/latest error:', e);
     res.status(500).json({ ok: false });
   }
 });
 
+// Raw latest events (array)
 app.get('/events/latest', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
@@ -408,6 +450,61 @@ app.get('/events/latest', async (req, res) => {
     res.json(docs);
   } catch (e) {
     console.error('GET /events/latest error:', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// NEW: latest one-per-device, already classified + short address (great for the app)
+app.get('/devices/latest', async (req, res) => {
+  try {
+    const docs = await Position.find({})
+      .sort({ fixTime: -1, createdAt: -1 })
+      .limit(600)
+      .lean();
+
+    const latest = new Map();
+    for (const p of docs) {
+      const id = p.deviceId ?? p.device?.id;
+      if (id == null) continue;
+      const when = whenOf(p);
+      const prev = latest.get(id);
+      if (!prev || when > whenOf(prev)) latest.set(id, p);
+    }
+
+    const data = [];
+    for (const [, pos] of latest) {
+      const when = whenOf(pos);
+      const ageMin = minutesSince(when);
+      const status = classifyFromPosition(pos);
+      const speed = Number(pos.speed || 0);
+      const attrs = pos.attributes || {};
+      const ign = readIgnition(attrs, speed, attrs.motion);
+      const name =
+        pos.raw?.device?.name ||
+        attrs.deviceName ||
+        `Device ${pos.deviceId}`;
+      const addr = shortAddress(pos.address) ||
+        ((pos.latitude != null && pos.longitude != null)
+          ? `${Number(pos.latitude).toFixed(5)}, ${Number(pos.longitude).toFixed(5)}`
+          : '');
+
+      data.push({
+        deviceId: pos.deviceId,
+        name,
+        status,            // running | idle | stopped  (your app should not mark "offline" here)
+        speed,
+        ignition: ign === true,
+        latitude: pos.latitude,
+        longitude: pos.longitude,
+        address: addr,
+        when,              // ISO date
+        ageMinutes: Math.round(ageMin * 10) / 10,
+      });
+    }
+
+    res.json({ ok: true, count: data.length, data });
+  } catch (e) {
+    console.error('GET /devices/latest error:', e);
     res.status(500).json({ ok: false });
   }
 });
@@ -430,4 +527,60 @@ app.listen(PORT, () => {
   if (!TRACCAR_SECRET) {
     console.warn('⚠️  TRACCAR_FORWARD_SECRET is not set — /traccar/forward will reject all posts.');
   }
+  if (ENABLE_RENDER_TAIL) {
+    console.log(`🔭 Render live tail enabled (every ${TAIL_EVERY_MS}ms)`);
+  } else {
+    console.log('🔭 Render live tail disabled (set ENABLE_RENDER_TAIL=true to enable)');
+  }
 });
+
+/* ---------- LIVE TAILER (logs every ~10s on Render) ---------- */
+async function liveTailOnce() {
+  try {
+    const docs = await Position.find({})
+      .sort({ fixTime: -1, createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    const latest = new Map();
+    for (const p of docs) {
+      const id = p.deviceId ?? p.device?.id;
+      if (id == null) continue;
+      const when = whenOf(p);
+      const prev = latest.get(id);
+      if (!prev || when > whenOf(prev)) latest.set(id, p);
+    }
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2,'0');
+    const mm = String(now.getMinutes()).padStart(2,'0');
+    const ss = String(now.getSeconds()).padStart(2,'0');
+
+    console.log(`[${hh}:${mm}:${ss}] Devices: ${latest.size}`);
+
+    for (const [, pos] of latest) {
+      const when = whenOf(pos);
+      const speed = Number(pos.speed || 0);
+      const status = classifyFromPosition(pos);
+      const name =
+        pos.raw?.device?.name ||
+        pos.attributes?.deviceName ||
+        `Device ${pos.deviceId}`;
+      const addr =
+        shortAddress(pos.address) ||
+        (pos.latitude != null && pos.longitude != null
+          ? `${Number(pos.latitude).toFixed(5)}, ${Number(pos.longitude).toFixed(5)}`
+          : '—');
+
+      console.log(
+        ` • ${name} | ${status.toUpperCase()} | ${speed} km/h | ${addr} | last ${when.toLocaleTimeString()}`
+      );
+    }
+  } catch (e) {
+    console.log('live-tail error:', e?.message || e);
+  }
+}
+if (ENABLE_RENDER_TAIL) {
+  setInterval(liveTailOnce, TAIL_EVERY_MS);
+  liveTailOnce();
+}
