@@ -11,30 +11,34 @@ const cors     = require('cors');
 const app = express();
 
 /* ---------- ENV ---------- */
-const PORT              = process.env.PORT || 3000;
-const MONGO_URL         = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
-const CORS_ORIGIN       = process.env.CORS_ORIGIN || '*';
-const NODE_ENV          = process.env.NODE_ENV || 'development';
+const PORT        = process.env.PORT || 3000;
+const MONGO_URL   = process.env.MONGO_URL || 'mongodb://127.0.0.1:27017/carTrackerDB';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const NODE_ENV    = process.env.NODE_ENV || 'development';
 
-const TRACCAR_SECRET    = process.env.TRACCAR_FORWARD_SECRET || ''; // REQUIRED in production
-const TRACCAR_IPS       = (process.env.TRACCAR_IPS || '').split(',').map(s => s.trim()).filter(Boolean);
+const TRACCAR_SECRET = process.env.TRACCAR_FORWARD_SECRET || '';
+const TRACCAR_IPS    = (process.env.TRACCAR_IPS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-// hide fake devices & test data
+// Hide fake/test devices (defaults to 123 per your request)
 const IGNORE_DEVICE_IDS = new Set(
-  (process.env.IGNORE_DEVICE_IDS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(n => Number(n))
-    .filter(n => Number.isFinite(n))
+  (process.env.IGNORE_DEVICE_IDS || '123')
+    .split(',').map(s => s.trim()).filter(Boolean)
+    .map(n => Number(n)).filter(n => Number.isFinite(n))
 );
 
-// admin purge
+// Admin purge (optional)
 const ADMIN_PURGE_SECRET = process.env.ADMIN_PURGE_SECRET || '';
 
-// live tail toggles (for Render logs)
+// Live-tail toggles (for Render logs)
 const ENABLE_RENDER_TAIL = (process.env.ENABLE_RENDER_TAIL || 'false').toLowerCase() === 'true';
 const TAIL_EVERY_MS      = Number(process.env.TAIL_EVERY_MS || 10000);
+
+/* ---- Movement / status tunables ---- */
+const SPEED_RUNNING_KMH = 3;
+const MOVED_MIN_METERS  = Number(process.env.MOVED_MIN_METERS || 50);
+const ACTIVE_WINDOW_MIN = Number(process.env.ACTIVE_WINDOW_MIN || 10);
+const FIX_PAIR_MAX_MIN  = Number(process.env.FIX_PAIR_MAX_MIN || 5);
 
 /* ---------- MIDDLEWARE ---------- */
 app.set('trust proxy', 1);
@@ -55,12 +59,9 @@ mongoose
   .then(() => console.log('MongoDB connected successfully'))
   .catch(err => console.error('MongoDB connection error:', err.message));
 
-mongoose.connection.on('disconnected', () =>
-  console.warn('MongoDB disconnected')
-);
+mongoose.connection.on('disconnected', () => console.warn('MongoDB disconnected'));
 
 /* ---------- MODELS ---------- */
-// Users
 const userSchema = new mongoose.Schema(
   {
     name:      { type: String, required: true },
@@ -72,7 +73,6 @@ const userSchema = new mongoose.Schema(
 );
 const User = mongoose.model('User', userSchema);
 
-// Positions
 const positionSchema = new mongoose.Schema(
   {
     deviceId: { type: Number, index: true },
@@ -100,7 +100,6 @@ const positionSchema = new mongoose.Schema(
 positionSchema.index({ deviceId: 1, fixTime: -1, createdAt: -1 });
 const Position = mongoose.model('Position', positionSchema);
 
-// Events
 const eventSchema = new mongoose.Schema(
   {
     deviceId: { type: Number, index: true },
@@ -116,11 +115,7 @@ eventSchema.index({ deviceId: 1, eventTime: -1, createdAt: -1 });
 const Event = mongoose.model('Event', eventSchema);
 
 /* ---------- HELPERS ---------- */
-const sanitizeUser = u => ({
-  name: u.name,
-  email: u.email,
-  fuelPrice: u.fuelPrice ?? 0,
-});
+const sanitizeUser = u => ({ name: u.name, email: u.email, fuelPrice: u.fuelPrice ?? 0 });
 
 function clientIp(req) {
   const xf = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -136,12 +131,22 @@ function toDate(v) {
   const d = new Date(v);
   return isNaN(d.getTime()) ? undefined : d;
 }
-
-const SPEED_RUNNING_KMH = 3;
-const truthy = (v) => v === true || v === 'true' || v === 1 || v === '1' || v === 'on' || v === 'ON';
 const whenOf = (p) => toDate(p.fixTime || p.deviceTime || p.serverTime || p.createdAt) || new Date(0);
 const minutesSince = (d) => (Date.now() - d.getTime()) / 60000;
+const truthy = (v) => v === true || v === 'true' || v === 1 || v === '1' || v === 'on' || v === 'ON';
 
+const isValidCoords = (p) => {
+  const lat = Number(p?.latitude), lon = Number(p?.longitude);
+  return Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0);
+};
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+          + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 const readIgnition = (attrs = {}, speed = 0, motion) => {
   const direct = attrs.ignition ?? attrs.acc ?? attrs.engine ?? attrs.Ignition ?? attrs.IGN;
   if (direct !== undefined) return truthy(direct);
@@ -149,32 +154,6 @@ const readIgnition = (attrs = {}, speed = 0, motion) => {
   if (motion === false || Number(speed) <= SPEED_RUNNING_KMH) return false;
   return null;
 };
-
-// Rule you requested:
-//  - OFFLINE only when we effectively have no data: lat=0 && lon=0 && speed=0 (or lat/lon missing)
-//  - Otherwise if speed <= 3 and motion != true => STOPPED (parked)
-//  - If ignition true & not moving => IDLE
-//  - Else RUNNING
-function classifyForUI(pos) {
-  const lat = Number(pos.latitude ?? 0);
-  const lon = Number(pos.longitude ?? 0);
-  const speed = Number(pos.speed ?? 0);
-  const a = pos.attributes || {};
-  const motion = a.motion;
-
-  const noCoords = !Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0);
-  const noSpeed  = !Number.isFinite(speed) || speed === 0;
-
-  if ((noCoords && noSpeed) || (lat === 0 && lon === 0 && speed === 0)) {
-    return 'offline';
-  }
-
-  const ign = readIgnition(a, speed, motion);
-  if (speed <= SPEED_RUNNING_KMH && motion !== true) {
-    return ign === true ? 'idle' : 'stopped';
-  }
-  return 'running';
-}
 
 const shortAddress = (line) => {
   if (!line) return '';
@@ -195,8 +174,7 @@ app.get('/health', (req, res) => {
 app.post('/register', async (req, res) => {
   console.log('POST /register', req.body?.email);
   const { name, email, password } = req.body || {};
-  if (!name || !email || !password)
-    return res.status(400).json({ message: 'Please fill in all fields' });
+  if (!name || !email || !password) return res.status(400).json({ message: 'Please fill in all fields' });
 
   try {
     const existingUser = await User.findOne({ email });
@@ -204,12 +182,9 @@ app.post('/register', async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-
     const newUser = await User.create({ name, email, password: hashedPassword });
-    res.status(201).json({
-      message: `Welcome ${name}! Account created successfully.`,
-      ...sanitizeUser(newUser),
-    });
+
+    res.status(201).json({ message: `Welcome ${name}! Account created successfully.`, ...sanitizeUser(newUser) });
   } catch (err) {
     console.error('Registration error:', err);
     res.status(500).json({ message: 'Server error' });
@@ -219,22 +194,16 @@ app.post('/register', async (req, res) => {
 app.post('/login', async (req, res) => {
   console.log('POST /login', req.body?.email);
   const { email, password } = req.body || {};
-  if (!email || !password)
-    return res.status(400).json({ message: 'Please fill in all fields' });
+  if (!email || !password) return res.status(400).json({ message: 'Please fill in all fields' });
 
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: 'Invalid email or password' });
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Invalid email or password' });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(400).json({ message: 'Invalid email or password' });
 
-    res.status(200).json({
-      message: 'Logged in successfully',
-      userName: user.name,
-      email: user.email,
-      fuelPrice: user.fuelPrice ?? 0,
-    });
+    res.status(200).json({ message: 'Logged in successfully', userName: user.name, email: user.email, fuelPrice: user.fuelPrice ?? 0 });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: 'Server error' });
@@ -275,12 +244,10 @@ app.post('/user/change-email', async (req, res) => {
 
     user.email = newEmail;
     await user.save();
-
     res.json({ message: 'Email updated', email: user.email });
   } catch (err) {
     console.error('change-email error:', err);
-    if (err?.code === 11000)
-      return res.status(400).json({ message: 'Email already in use' });
+    if (err?.code === 11000) return res.status(400).json({ message: 'Email already in use' });
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -301,7 +268,6 @@ app.post('/user/change-password', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     user.password = await bcrypt.hash(newPassword, salt);
     await user.save();
-
     res.json({ message: 'Password updated' });
   } catch (err) {
     console.error('change-password error:', err);
@@ -316,13 +282,8 @@ app.post('/user/fuel-price', async (req, res) => {
     return res.status(400).json({ message: 'email and numeric fuelPrice are required' });
 
   try {
-    const user = await User.findOneAndUpdate(
-      { email },
-      { $set: { fuelPrice } },
-      { new: true }
-    );
+    const user = await User.findOneAndUpdate({ email }, { $set: { fuelPrice } }, { new: true });
     if (!user) return res.status(404).json({ message: 'User not found' });
-
     res.json({ message: 'Fuel price saved', fuelPrice: user.fuelPrice });
   } catch (err) {
     console.error('fuel-price error:', err);
@@ -333,41 +294,28 @@ app.post('/user/fuel-price', async (req, res) => {
 /* ---------- TRACCAR FORWARDER ---------- */
 app.post('/traccar/forward', async (req, res) => {
   try {
-    // 1) Secret check
-    const given =
-      req.query.secret ||
-      req.headers['x-traccar-secret'] ||
-      req.headers['x-forward-secret'];
+    const given = req.query.secret || req.headers['x-traccar-secret'] || req.headers['x-forward-secret'];
+    if (!TRACCAR_SECRET || given !== TRACCAR_SECRET) return res.status(401).json({ ok: false, error: 'bad-secret' });
 
-    if (!TRACCAR_SECRET || given !== TRACCAR_SECRET) {
-      return res.status(401).json({ ok: false, error: 'bad-secret' });
-    }
-
-    // 2) Optional IP allow list
     if (TRACCAR_IPS.length) {
       const ip = clientIp(req);
       const allowed = TRACCAR_IPS.includes(ip);
       if (!allowed) return res.status(403).json({ ok: false, error: 'ip-not-allowed', ip });
     }
 
-    // 3) Normalize payload
-    const payload = req.body;
-    const items = Array.isArray(payload) ? payload : [payload];
-
+    const items = Array.isArray(req.body) ? req.body : [req.body];
     const positions = [];
     const events = [];
 
     for (const it of items) {
       if (!it || typeof it !== 'object') continue;
 
-      // Event forward payload format
       if (it.event) {
-        const ev = it.event || {};
+        const ev  = it.event || {};
         const pos = it.position || {};
         const deviceId = ensureNumber(ev.deviceId ?? pos.deviceId ?? it.deviceId);
-        if (deviceId != null && IGNORE_DEVICE_IDS.has(deviceId)) {
-          continue; // drop ignored devices
-        }
+        if (deviceId != null && IGNORE_DEVICE_IDS.has(deviceId)) continue;
+
         events.push({
           deviceId,
           type: ev.type,
@@ -377,7 +325,7 @@ app.post('/traccar/forward', async (req, res) => {
           raw: it,
         });
 
-        if (pos && (pos.latitude !== undefined && pos.longitude !== undefined)) {
+        if (pos && pos.latitude !== undefined && pos.longitude !== undefined) {
           positions.push({
             ...pos,
             deviceId,
@@ -387,12 +335,9 @@ app.post('/traccar/forward', async (req, res) => {
         continue;
       }
 
-      // Position-only payload
       const pos = it.position || it;
       const deviceId = ensureNumber(pos.deviceId ?? pos.device?.id ?? it.deviceId);
-      if (deviceId != null && IGNORE_DEVICE_IDS.has(deviceId)) {
-        continue; // drop ignored devices
-      }
+      if (deviceId != null && IGNORE_DEVICE_IDS.has(deviceId)) continue;
       if (pos && pos.latitude !== undefined && pos.longitude !== undefined) {
         positions.push({
           ...pos,
@@ -402,19 +347,12 @@ app.post('/traccar/forward', async (req, res) => {
       }
     }
 
-    // Debug: brief sample
-    const now = new Date().toISOString();
-    const sample = positions[0] || (events[0]?.position) || null;
-    console.log(
-      `[TRACCAR] ${now} recv: pos=${positions.length} evt=${events.length}` +
-      (sample
-        ? ` dev=${sample.deviceId ?? 'n/a'} lat=${sample.latitude ?? 'n/a'} lon=${sample.longitude ?? 'n/a'}`
-        : '')
-    );
+    const nowIso = new Date().toISOString();
+    const sample = positions[0] || null;
+    console.log(`[TRACCAR] ${nowIso} recv: pos=${positions.length} evt=${events.length}` +
+      (sample ? ` dev=${sample.deviceId ?? 'n/a'} lat=${sample.latitude ?? 'n/a'} lon=${sample.longitude ?? 'n/a'}` : ''));
 
-    // 4) Save to DB
-    let savedPos = 0;
-    let savedEvt = 0;
+    let savedPos = 0, savedEvt = 0;
 
     if (positions.length) {
       const docs = positions.map(p => ({
@@ -422,7 +360,7 @@ app.post('/traccar/forward', async (req, res) => {
         protocol: p.protocol,
         serverTime: toDate(p.serverTime),
         deviceTime: toDate(p.deviceTime),
-        fixTime: toDate(p.fixTime) || new Date(),
+        fixTime:   toDate(p.fixTime) || new Date(),
         valid: !!p.valid,
         latitude: ensureNumber(p.latitude),
         longitude: ensureNumber(p.longitude),
@@ -443,10 +381,7 @@ app.post('/traccar/forward', async (req, res) => {
       savedEvt = resEvt.length;
     }
 
-    if (savedPos || savedEvt) {
-      console.log(`[TRACCAR] saved: pos=${savedPos} evt=${savedEvt}`);
-    }
-
+    if (savedPos || savedEvt) console.log(`[TRACCAR] saved: pos=${savedPos} evt=${savedEvt}`);
     return res.json({ ok: true, positions: savedPos, events: savedEvt });
   } catch (e) {
     console.error('traccar/forward error:', e);
@@ -454,14 +389,12 @@ app.post('/traccar/forward', async (req, res) => {
   }
 });
 
-/* ---------- SIMPLE READ APIS FOR APP ---------- */
-// Raw latest positions (array)  — still available if you need it
+/* ---------- SIMPLE READ APIS ---------- */
 app.get('/positions/latest', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
     const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
     const q = deviceId ? { deviceId } : {};
-    // filter ignored devices
     const docs = await Position.find(q).sort({ fixTime: -1, createdAt: -1 }).limit(limit);
     res.json(docs.filter(d => !IGNORE_DEVICE_IDS.has(Number(d.deviceId))));
   } catch (e) {
@@ -470,7 +403,6 @@ app.get('/positions/latest', async (req, res) => {
   }
 });
 
-// Raw latest events (array)
 app.get('/events/latest', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
@@ -484,48 +416,87 @@ app.get('/events/latest', async (req, res) => {
   }
 });
 
-// One-per-device, already classified & short address (recommended for app)
+/* ---------- One-per-device (already classified) ---------- */
 app.get('/devices/latest', async (req, res) => {
   try {
-    const docs = await Position.find({})
-      .sort({ fixTime: -1, createdAt: -1 })
-      .limit(800)
-      .lean();
+    const docs = await Position.find({}).sort({ fixTime: -1, createdAt: -1 }).limit(1000).lean();
 
-    const latest = new Map();
+    // Build last & prev (best two) per device
+    const pairs = new Map(); // id -> { last, prev }
     for (const p of docs) {
       const id = Number(p.deviceId ?? p.device?.id);
       if (!Number.isFinite(id) || IGNORE_DEVICE_IDS.has(id)) continue;
-      const when = whenOf(p);
-      const prev = latest.get(id);
-      if (!prev || when > whenOf(prev)) latest.set(id, p);
+      const entry = pairs.get(id) || {};
+      if (!entry.last || whenOf(p) > whenOf(entry.last)) {
+        entry.prev = entry.last;
+        entry.last = p;
+      } else if (!entry.prev || whenOf(p) > whenOf(entry.prev)) {
+        entry.prev = p;
+      }
+      pairs.set(id, entry);
     }
 
     const data = [];
-    for (const [, pos] of latest) {
-      const when = whenOf(pos);
-      const speed = Number(pos.speed || 0);
-      const status = classifyForUI(pos);
-      const attrs = pos.attributes || {};
-      const ign = readIgnition(attrs, speed, attrs.motion);
-      const name = pos.raw?.device?.name || attrs.deviceName || `Device ${pos.deviceId}`;
+    for (const [id, { last, prev }] of pairs) {
+      if (!last) continue;
+
+      // OFFLINE only when absolutely no usable data
+      const noCoords = !isValidCoords(last);
+      const speed = Number(last.speed || 0);
+      const noSpeed  = !Number.isFinite(speed) || speed === 0;
+      if ((noCoords && noSpeed) || (noCoords && !prev)) {
+        data.push({
+          deviceId: id,
+          name: last.raw?.device?.name || last.attributes?.deviceName || `Device ${id}`,
+          status: 'offline',
+          speed: 0,
+          ignition: false,
+          latitude: last.latitude,
+          longitude: last.longitude,
+          address: '',
+          when: whenOf(last),
+          ageMinutes: Math.round(minutesSince(whenOf(last)) * 10) / 10,
+        });
+        continue;
+      }
+
+      // Movement gating (recency + displacement)
+      const lastWhen = whenOf(last);
+      const ageMin   = minutesSince(lastWhen);
+      let movedMeters = 0, pairAgeMin = Infinity;
+      if (prev && isValidCoords(prev) && isValidCoords(last)) {
+        movedMeters = haversine(
+          Number(prev.latitude), Number(prev.longitude),
+          Number(last.latitude), Number(last.longitude)
+        );
+        pairAgeMin = Math.abs(lastWhen - whenOf(prev)) / 60000;
+      }
+      const movedOk = pairAgeMin <= FIX_PAIR_MAX_MIN && movedMeters >= MOVED_MIN_METERS;
+      const motion  = (last.attributes || {}).motion;
+      const ign     = readIgnition(last.attributes || {}, speed, motion);
+
+      const moving = (ageMin <= ACTIVE_WINDOW_MIN) &&
+                     (speed > SPEED_RUNNING_KMH || motion === true || movedOk);
+
+      const status = moving ? 'running' : (ign === true ? 'idle' : 'stopped');
+
       const addr =
-        shortAddress(pos.address) ||
-        (Number(pos.latitude) || Number(pos.longitude)
-          ? `${Number(pos.latitude).toFixed(5)}, ${Number(pos.longitude).toFixed(5)}`
+        shortAddress(last.address) ||
+        (isValidCoords(last)
+          ? `${Number(last.latitude).toFixed(5)}, ${Number(last.longitude).toFixed(5)}`
           : '');
 
       data.push({
-        deviceId: pos.deviceId,
-        name,
-        status,                // offline only for 0/0+0; else stopped/idle/running
+        deviceId: id,
+        name: last.raw?.device?.name || last.attributes?.deviceName || `Device ${id}`,
+        status,
         speed,
         ignition: ign === true,
-        latitude: pos.latitude,
-        longitude: pos.longitude,
+        latitude: last.latitude,
+        longitude: last.longitude,
         address: addr,
-        when,                  // ISO date
-        ageMinutes: Math.round(minutesSince(when) * 10) / 10,
+        when: lastWhen,
+        ageMinutes: Math.round(ageMin * 10) / 10,
       });
     }
 
@@ -536,7 +507,7 @@ app.get('/devices/latest', async (req, res) => {
   }
 });
 
-/* ---------- ADMIN: purge ignored devices (one-time cleanup) ---------- */
+/* ---------- ADMIN: purge ignored devices ---------- */
 app.post('/admin/purge-ignored', async (req, res) => {
   try {
     if (!ADMIN_PURGE_SECRET) return res.status(403).json({ ok: false, error: 'disabled' });
@@ -556,61 +527,83 @@ app.post('/admin/purge-ignored', async (req, res) => {
 });
 
 /* ---------- 404 & 500 ---------- */
-app.use((req, res) => {
-  res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
-});
-
+app.use((req, res) => res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` }));
 // eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ message: 'Server error' });
-});
+app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).json({ message: 'Server error' }); });
 
 /* ---------- START ---------- */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT} [${NODE_ENV}]`);
   console.log(`Mongo URL: ${MONGO_URL.includes('mongodb') ? 'atlas/local' : 'local'} (hidden)`);
   if (!TRACCAR_SECRET) console.warn('⚠️  TRACCAR_FORWARD_SECRET is not set — /traccar/forward will reject all posts.');
-  if (ENABLE_RENDER_TAIL) console.log(`🔭 Render live tail enabled (every ${TAIL_EVERY_MS}ms)`);
-  else console.log('🔭 Render live tail disabled (set ENABLE_RENDER_TAIL=true to enable)');
+  if (ENABLE_RENDER_TAIL) console.log(`🔭 Render live tail enabled (every ${TAIL_EVERY_MS}ms)`); else console.log('🔭 Render live tail disabled (set ENABLE_RENDER_TAIL=true to enable)');
 });
 
-/* ---------- LIVE TAILER (logs every ~10s on Render) ---------- */
+/* ---------- LIVE TAILER (logs ~every 10s on Render) ---------- */
 async function liveTailOnce() {
   try {
-    const docs = await Position.find({})
-      .sort({ fixTime: -1, createdAt: -1 })
-      .limit(800)
-      .lean();
+    const docs = await Position.find({}).sort({ fixTime: -1, createdAt: -1 }).limit(1000).lean();
 
-    const latest = new Map();
+    // Build last & prev per device
+    const pairs = new Map();
     for (const p of docs) {
       const id = Number(p.deviceId ?? p.device?.id);
       if (!Number.isFinite(id) || IGNORE_DEVICE_IDS.has(id)) continue;
-      const when = whenOf(p);
-      const prev = latest.get(id);
-      if (!prev || when > whenOf(prev)) latest.set(id, p);
+      const entry = pairs.get(id) || {};
+      if (!entry.last || whenOf(p) > whenOf(entry.last)) {
+        entry.prev = entry.last;
+        entry.last = p;
+      } else if (!entry.prev || whenOf(p) > whenOf(entry.prev)) {
+        entry.prev = p;
+      }
+      pairs.set(id, entry);
     }
 
     const now = new Date();
     const hh = String(now.getHours()).padStart(2,'0');
     const mm = String(now.getMinutes()).padStart(2,'0');
     const ss = String(now.getSeconds()).padStart(2,'0');
+    console.log(`[${hh}:${mm}:${ss}] Devices: ${pairs.size}`);
 
-    console.log(`[${hh}:${mm}:${ss}] Devices: ${latest.size}`);
+    for (const [id, { last, prev }] of pairs) {
+      const lastWhen = whenOf(last);
+      const ageMin   = minutesSince(lastWhen);
+      const speed    = Number(last.speed || 0);
+      const attrs    = last.attributes || {};
+      const motion   = attrs.motion;
+      const ign      = readIgnition(attrs, speed, motion);
 
-    for (const [, pos] of latest) {
-      const status = classifyForUI(pos);
-      const speed = Number(pos.speed || 0);
-      const name = pos.raw?.device?.name || pos.attributes?.deviceName || `Device ${pos.deviceId}`;
-      const addr =
-        shortAddress(pos.address) ||
-        (Number(pos.latitude) || Number(pos.longitude)
-          ? `${Number(pos.latitude).toFixed(5)}, ${Number(pos.longitude).toFixed(5)}`
+      let movedMeters = 0, pairAgeMin = Infinity;
+      if (prev && isValidCoords(prev) && isValidCoords(last)) {
+        movedMeters = haversine(
+          Number(prev.latitude), Number(prev.longitude),
+          Number(last.latitude), Number(last.longitude)
+        );
+        pairAgeMin = Math.abs(lastWhen - whenOf(prev)) / 60000;
+      }
+      const movedOk = pairAgeMin <= FIX_PAIR_MAX_MIN && movedMeters >= MOVED_MIN_METERS;
+
+      // OFFLINE only for zero/missing
+      const noCoords = !isValidCoords(last);
+      const noSpeed  = !Number.isFinite(speed) || speed === 0;
+      let status;
+      if ((noCoords && noSpeed) || (noCoords && !prev)) status = 'OFFLINE';
+      else {
+        const moving = (ageMin <= ACTIVE_WINDOW_MIN) &&
+                       (speed > SPEED_RUNNING_KMH || motion === true || movedOk);
+        status = moving ? 'RUNNING' : (ign === true ? 'IDLE' : 'STOPPED');
+      }
+
+      const addr = shortAddress(last.address) ||
+        (isValidCoords(last)
+          ? `${Number(last.latitude).toFixed(5)}, ${Number(last.longitude).toFixed(5)}`
           : '—');
-      const when = whenOf(pos);
 
-      console.log(` • ${name} | ${status.toUpperCase()} | ${speed} km/h | ${addr} | last ${when.toLocaleTimeString()}`);
+      const movedTxt = isFinite(movedMeters) && isFinite(pairAgeMin)
+        ? ` | moved ${Math.round(movedMeters)}m / ${isFinite(pairAgeMin) ? pairAgeMin.toFixed(1) : '?'}m`
+        : '';
+
+      console.log(` • ${last.raw?.device?.name || attrs.deviceName || `Device ${id}`} | ${status} | ${speed} km/h | ${addr} | last ${lastWhen.toLocaleTimeString()}${movedTxt}`);
     }
   } catch (e) {
     console.log('live-tail error:', e?.message || e);
