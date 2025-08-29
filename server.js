@@ -1,5 +1,6 @@
 // backend/server.js
 // Express API for car-tracker + Traccar forwarder + live tail + per-device latest
+
 try { require('dotenv').config(); } catch (_) {}
 
 const express  = require('express');
@@ -44,10 +45,7 @@ async function httpGetJson(url, timeoutMs = 4500) {
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await (hasGlobalFetch ? fetch : (await import('node-fetch')).default)(url, {
-      headers: {
-        'User-Agent': `car-tracker/1.0 (${GEOCODER_EMAIL})`,
-        'Accept': 'application/json'
-      },
+      headers: { 'User-Agent': `car-tracker/1.0 (${GEOCODER_EMAIL})`, 'Accept': 'application/json' },
       signal: controller.signal
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -60,40 +58,26 @@ const geoCache = new Map();
 const GEO_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 const geoKey = (lat, lon) => `${Number(lat).toFixed(3)},${Number(lon).toFixed(3)}`;
 
-// Build a short area string: e.g. "Latifabad, Sindh, PK"
 function composeAreaFromAddress(a = {}) {
-  // locality preference
   const locality =
     a.neighbourhood || a.neighborhood ||
-    a.suburb ||
-    a.city_district ||
-    a.town || a.village ||
-    a.city || a.county;
-
-  // admin/state fallback chain
-  const admin =
-    a.state || a.province || a.region || a.state_district || a.county;
-
+    a.suburb || a.city_district ||
+    a.town || a.village || a.city || a.county;
+  const admin = a.state || a.province || a.region || a.state_district || a.county;
   const cc = (a.country_code || '').toUpperCase();
-
   const parts = [];
   if (locality) parts.push(locality);
   if (admin) parts.push(admin);
   if (cc) parts.push(cc);
   return parts.join(', ');
 }
-
 async function reverseGeocodeShort(lat, lon) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return '';
   const key = geoKey(lat, lon);
   const now = Date.now();
   const cached = geoCache.get(key);
   if (cached && now - cached.t < GEO_TTL_MS) return cached.v;
-
-  const url =
-    `${GEOCODER_BASE}/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}` +
-    `&zoom=13&addressdetails=1&accept-language=${GEOCODER_LANG}&email=${encodeURIComponent(GEOCODER_EMAIL)}`;
-
+  const url = `${GEOCODER_BASE}/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=13&addressdetails=1&accept-language=${GEOCODER_LANG}&email=${encodeURIComponent(GEOCODER_EMAIL)}`;
   try {
     const j = await httpGetJson(url, 4500);
     const area = composeAreaFromAddress(j?.address);
@@ -109,7 +93,6 @@ async function reverseGeocodeShort(lat, lon) {
 /* ---------- MIDDLEWARE ---------- */
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '5mb' }));
-
 const corsOptions = {
   origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map(s => s.trim()),
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -124,7 +107,6 @@ mongoose
   .connect(MONGO_URL, { serverSelectionTimeoutMS: 8000 })
   .then(() => console.log('MongoDB connected successfully'))
   .catch(err => console.error('MongoDB connection error:', err.message));
-
 mongoose.connection.on('disconnected', () => console.warn('MongoDB disconnected'));
 
 /* ---------- MODELS ---------- */
@@ -181,7 +163,6 @@ const minutesSince = (d) => (Date.now() - d.getTime()) / 60000;
 
 const shortAddress = (line) => {
   if (!line) return '';
-  // keep last 3 parts if string is long, and normalize country name to PK
   const parts = String(line).split(',').map(s => s.trim()).filter(Boolean);
   const s = parts.slice(-3).join(', ').replace(/Pakistan$/i, 'PK');
   return s || line;
@@ -195,7 +176,7 @@ const readIgnition = (attrs = {}, speed = 0, motion) => {
   return null;
 };
 
-// OFFLINE only for 0/0 (+ speed 0 or missing); else stopped/idle/running
+// PARKED (not "stopped") when stationary & ignition false
 function classifyForUI(pos) {
   const lat = Number(pos.latitude ?? 0);
   const lon = Number(pos.longitude ?? 0);
@@ -208,8 +189,65 @@ function classifyForUI(pos) {
 
   if ((noCoords && noSpeed) || (lat === 0 && lon === 0 && speed === 0)) return 'offline';
   const ign = readIgnition(a, speed, motion);
-  if (speed <= SPEED_RUNNING_KMH && motion !== true) return ign === true ? 'idle' : 'stopped';
+  if (speed <= SPEED_RUNNING_KMH && motion !== true) return ign === true ? 'idle' : 'parked';
   return 'running';
+}
+
+/* ---------- Battery normalization + backfill ---------- */
+function normalizeBattery(attrs = {}) {
+  const num = (v) => (v === '' || v == null ? null : Number(v));
+  const lvlRaw = attrs.batteryLevel ?? attrs.battery_level ?? attrs.batteryPercent ?? attrs.battery;
+  const lvlNum = num(lvlRaw);
+  const batteryLevel = Number.isFinite(lvlNum) && lvlNum >= 0 && lvlNum <= 100 ? Math.round(lvlNum) : null;
+
+  const vRaw =
+    attrs.power ?? attrs.batteryVoltage ?? attrs.voltage ??
+    attrs.batt ?? attrs.battery_v ?? attrs.adc1;
+  const vNum = num(vRaw);
+  const batteryVoltage = Number.isFinite(vNum) ? Number(vNum.toFixed(1)) : null;
+
+  const chargingRaw = attrs.charge ?? attrs.charging ?? attrs.usbPower ?? attrs.externalPower;
+  const charging = chargingRaw === true || chargingRaw === 'true' || chargingRaw === 1 || chargingRaw === '1' || chargingRaw === 'on' || chargingRaw === 'ON';
+
+  const batteryText = batteryLevel != null ? `${batteryLevel}%`
+                    : batteryVoltage != null ? `${batteryVoltage}V`
+                    : '—';
+
+  return { batteryLevel, batteryVoltage, batteryCharging: !!charging, batteryText };
+}
+
+const BATTERY_KEYS_QUERY = {
+  $or: [
+    { 'attributes.batteryLevel': { $exists: true } },
+    { 'attributes.battery_level': { $exists: true } },
+    { 'attributes.batteryPercent': { $exists: true } },
+    { 'attributes.battery': { $exists: true } },
+    { 'attributes.power': { $exists: true } },
+    { 'attributes.batteryVoltage': { $exists: true } },
+    { 'attributes.voltage': { $exists: true } },
+    { 'attributes.batt': { $exists: true } },
+    { 'attributes.battery_v': { $exists: true } },
+    { 'attributes.adc1': { $exists: true } },
+  ]
+};
+
+async function backfillBatteryAttrs(deviceId) {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const pos = await Position.findOne({
+    deviceId,
+    fixTime: { $gte: sevenDaysAgo },
+    ...BATTERY_KEYS_QUERY
+  }).sort({ fixTime: -1 }).lean();
+
+  if (pos?.attributes) return pos.attributes;
+
+  const evt = await Event.findOne({
+    deviceId,
+    eventTime: { $gte: sevenDaysAgo },
+    ...BATTERY_KEYS_QUERY
+  }).sort({ eventTime: -1 }).lean();
+
+  return evt?.attributes || null;
 }
 
 /* ---------- HEALTH ---------- */
@@ -217,7 +255,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'Server is running', env: NODE_ENV, mongo: mongoose.connection.readyState === 1 ? 'connected' : 'not-connected' });
 });
 
-/* ---------- AUTH ---------- */
+/* ---------- AUTH & USER ---------- */
 app.post('/register', async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ message: 'Please fill in all fields' });
@@ -233,6 +271,7 @@ app.post('/register', async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
 app.post('/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ message: 'Please fill in all fields' });
@@ -244,6 +283,71 @@ app.post('/login', async (req, res) => {
     res.status(200).json({ message: 'Logged in successfully', userName: user.name, email: user.email, fuelPrice: user.fuelPrice ?? 0 });
   } catch (err) {
     console.error('Login error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/user', async (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json(sanitizeUser(user));
+  } catch (err) {
+    console.error('GET /user error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/user/change-email', async (req, res) => {
+  const { currentEmail, password, newEmail } = req.body || {};
+  if (!currentEmail || !password || !newEmail) return res.status(400).json({ message: 'currentEmail, password and newEmail are required' });
+  try {
+    const user = await User.findOne({ email: currentEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(400).json({ message: 'Incorrect password' });
+    if (currentEmail === newEmail) return res.status(400).json({ message: 'New email is the same as current' });
+    const exists = await User.findOne({ email: newEmail });
+    if (exists) return res.status(400).json({ message: 'New email already in use' });
+    user.email = newEmail;
+    await user.save();
+    res.json({ message: 'Email updated', email: user.email });
+  } catch (err) {
+    console.error('change-email error:', err);
+    if (err?.code === 11000) return res.status(400).json({ message: 'Email already in use' });
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/user/change-password', async (req, res) => {
+  const { email, currentPassword, newPassword } = req.body || {};
+  if (!email || !currentPassword || !newPassword) return res.status(400).json({ message: 'email, currentPassword and newPassword are required' });
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    const ok = await bcrypt.compare(currentPassword, user.password);
+    if (!ok) return res.status(400).json({ message: 'Incorrect current password' });
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(newPassword, salt);
+    await user.save();
+    res.json({ message: 'Password updated' });
+  } catch (err) {
+    console.error('change-password error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/user/fuel-price', async (req, res) => {
+  const { email, fuelPrice } = req.body || {};
+  if (!email || typeof fuelPrice !== 'number') return res.status(400).json({ message: 'email and numeric fuelPrice are required' });
+  try {
+    const user = await User.findOneAndUpdate({ email }, { $set: { fuelPrice } }, { new: true });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ message: 'Fuel price saved', fuelPrice: user.fuelPrice });
+  } catch (err) {
+    console.error('fuel-price error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -309,12 +413,12 @@ app.post('/traccar/forward', async (req, res) => {
       speed: ensureNumber(p.speed),
       course: ensureNumber(p.course),
       accuracy: ensureNumber(p.accuracy),
-      address: p.address, // may be missing
+      address: p.address,
       attributes: p.attributes || {},
       raw: p,
     }));
 
-    // Fallback geocode if address missing
+    // fallback geocode
     if (USE_FALLBACK_GEOCODER && docs.length) {
       for (const d of docs) {
         if ((!d.address || d.address === '') &&
@@ -366,7 +470,8 @@ app.get('/events/latest', async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 200);
     const deviceId = req.query.deviceId ? Number(req.query.deviceId) : undefined;
     const q = deviceId ? { deviceId } : {};
-    const docs = await Event.find(q).sort({ eventTime: -1, createdAt: -1 }).limit(limit);
+    // lean() so _id serializes as a plain string
+    const docs = await Event.find(q).sort({ eventTime: -1, createdAt: -1 }).limit(limit).lean();
     res.json(docs.filter(d => !IGNORE_DEVICE_IDS.has(Number(d.deviceId))));
   } catch (e) {
     console.error('GET /events/latest error:', e);
@@ -374,7 +479,49 @@ app.get('/events/latest', async (req, res) => {
   }
 });
 
-// One-per-device, classified, with area + coords
+/* ---------- DELETE EVENTS (robust) ---------- */
+const { Types: { ObjectId } } = mongoose;
+
+function parseIds(maybe) {
+  // Accept: array, JSON string, comma string, or query param
+  let arr = [];
+  if (Array.isArray(maybe)) arr = maybe;
+  else if (typeof maybe === 'string') {
+    try {
+      const j = JSON.parse(maybe);
+      if (Array.isArray(j)) arr = j;
+      else arr = String(maybe).split(',').map(s => s.trim()).filter(Boolean);
+    } catch {
+      arr = String(maybe).split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
+  // Keep only valid ObjectIds
+  const ids = arr
+    .map(s => (typeof s === 'string' ? s : String(s)))
+    .filter(s => ObjectId.isValid(s))
+    .map(s => new ObjectId(s));
+  return ids;
+}
+
+app.post('/events/delete', async (req, res) => {
+  try {
+    // ids can be in body.ids (array) or ?ids=...
+    const ids = [
+      ...parseIds(req.body?.ids),
+      ...parseIds(req.query?.ids)
+    ];
+    if (!ids.length) {
+      return res.status(400).json({ ok: false, error: 'No valid ids provided' });
+    }
+    const result = await Event.deleteMany({ _id: { $in: ids } });
+    res.json({ ok: true, deleted: result.deletedCount || 0 });
+  } catch (e) {
+    console.error('POST /events/delete error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ---------- DEVICES SNAPSHOT ---------- */
 app.get('/devices/latest', async (req, res) => {
   try {
     const docs = await Position.find({}).sort({ fixTime: -1, createdAt: -1 }).limit(800).lean();
@@ -393,7 +540,18 @@ app.get('/devices/latest', async (req, res) => {
         const when = whenOf(pos);
         const speed = Number(pos.speed || 0);
         const status = classifyForUI(pos);
-        const attrs = pos.attributes || {};
+
+        // attrs + optional backfill for battery
+        let attrs = pos.attributes || {};
+        let { batteryLevel, batteryVoltage, batteryCharging, batteryText } = normalizeBattery(attrs);
+        if (batteryText === '—') {
+          const back = await backfillBatteryAttrs(pos.deviceId);
+          if (back) {
+            attrs = { ...back, ...attrs };
+            ({ batteryLevel, batteryVoltage, batteryCharging, batteryText } = normalizeBattery(attrs));
+          }
+        }
+
         const ign = readIgnition(attrs, speed, attrs.motion);
         const name = pos.raw?.device?.name || attrs.deviceName || `Device ${pos.deviceId}`;
 
@@ -415,11 +573,15 @@ app.get('/devices/latest', async (req, res) => {
           ignition: ign === true,
           latitude: pos.latitude,
           longitude: pos.longitude,
-          address: addr,                 // e.g. "Latifabad, Sindh, PK"
-          coords,                        // "25.35037, 68.38416"
+          address: addr,
+          coords,
           addressLabel: addr && coords ? `${addr} | ${coords}` : (addr || coords),
           when,
           ageMinutes: Math.round(minutesSince(when) * 10) / 10,
+          batteryLevel,
+          batteryVoltage,
+          batteryCharging,
+          batteryText,
         };
       })
     );
@@ -450,6 +612,7 @@ app.post('/admin/purge-ignored', async (req, res) => {
 
 /* ---------- 404 & 500 ---------- */
 app.use((req, res) => res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` }));
+// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).json({ message: 'Server error' }); });
 
 /* ---------- START ---------- */
@@ -482,6 +645,15 @@ async function liveTailOnce() {
     for (const [, pos] of latest) {
       const status = classifyForUI(pos);
       const speed = Number(pos.speed || 0);
+
+      // get battery (with backfill)
+      let attrs = pos.attributes || {};
+      let { batteryText } = normalizeBattery(attrs);
+      if (batteryText === '—') {
+        const back = await backfillBatteryAttrs(pos.deviceId);
+        if (back) ({ batteryText } = normalizeBattery({ ...back, ...attrs }));
+      }
+
       let addr = shortAddress(pos.address);
       if (!addr && USE_FALLBACK_GEOCODER &&
           Number.isFinite(pos.latitude) && Number.isFinite(pos.longitude) &&
@@ -493,7 +665,8 @@ async function liveTailOnce() {
         : '—';
       const when = whenOf(pos);
       const name = pos.raw?.device?.name || pos.attributes?.deviceName || `Device ${pos.deviceId}`;
-      console.log(` • ${name} | ${status.toUpperCase()} | ${speed} km/h | ${addr} | ${coords} | last ${when.toLocaleTimeString()}`);
+
+      console.log(` • ${name} | ${status.toUpperCase()} | ${speed} km/h | ${addr} | ${coords} | batt ${batteryText} | last ${when.toLocaleTimeString()}`);
     }
   } catch (e) {
     console.log('live-tail error:', e?.message || e);
